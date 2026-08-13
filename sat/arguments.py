@@ -211,9 +211,13 @@ def initialize_distributed(args):
         default_master_port = "6000"
     args.master_port = os.getenv("MASTER_PORT", default_master_port)
     init_method += args.master_ip + ":" + args.master_port
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend, world_size=args.world_size, rank=args.rank, init_method=init_method
-    )
+    init_kwargs = {
+        "backend": args.distributed_backend, "world_size": args.world_size,
+        "rank": args.rank, "init_method": init_method,
+    }
+    if args.distributed_backend == "nccl" and args.device != "cpu":
+        init_kwargs["device_id"] = torch.device(f"cuda:{args.device}")
+    torch.distributed.init_process_group(**init_kwargs)
 
     # Set the model-parallel / data-parallel communicators.
     mpu.initialize_model_parallel(args.model_parallel_size)

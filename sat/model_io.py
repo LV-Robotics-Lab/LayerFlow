@@ -284,7 +284,9 @@ def load_checkpoint(model, args, load_path=None, prefix='', specific_iteration=N
             print_all('global rank {} is loading checkpoint {}'.format(
                 torch.distributed.get_rank(), checkpoint_name))
 
-    sd = torch.load(checkpoint_name, map_location='cpu')
+    # PyTorch 2.6+ defaults to weights_only=True; this official checkpoint also stores RNG state.
+    # The benchmark records and trusts the released LayerFlow checkpoint source explicitly.
+    sd = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
     
     # if given `prefix`, load a speficic prefix in the checkpoint, e.g. encoder
     new_sd = {'module':{}}

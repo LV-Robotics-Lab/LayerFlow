@@ -1,4 +1,5 @@
 import random
+import os
 
 import math
 from typing import Any, Dict, List, Tuple, Union
@@ -377,12 +378,25 @@ class SATVideoDiffusionEngine(nn.Module):
         all_out = []
         with torch.autocast("cuda", enabled=not self.disable_first_stage_autocast):
             for n in range(n_rounds):
-                if isinstance(self.first_stage_model.decoder, VideoDecoder):
-                    kwargs = {"timesteps": len(z[n * n_samples : (n + 1) * n_samples])}
-                else:
-                    kwargs = {}
+                z_batch = z[n * n_samples : (n + 1) * n_samples]
                 use_cp = False
-                out = self.first_stage_model.decode(z[n * n_samples : (n + 1) * n_samples], **kwargs)
+                temporal_chunk = int(os.environ.get("LAYERFLOW_VAE_TEMPORAL_CHUNK", "0"))
+                if temporal_chunk > 0 and z_batch.ndim == 5 and z_batch.shape[2] > temporal_chunk:
+                    layer_outputs = []
+                    for start in range(0, z_batch.shape[2], temporal_chunk):
+                        z_part = z_batch[:, :, start : start + temporal_chunk].contiguous()
+                        kwargs = {"timesteps": len(z_part)} if isinstance(
+                            self.first_stage_model.decoder, VideoDecoder
+                        ) else {}
+                        layer_outputs.append(self.first_stage_model.decode(z_part, **kwargs))
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    out = torch.cat(layer_outputs, dim=2)
+                else:
+                    kwargs = {"timesteps": len(z_batch)} if isinstance(
+                        self.first_stage_model.decoder, VideoDecoder
+                    ) else {}
+                    out = self.first_stage_model.decode(z_batch, **kwargs)
                 all_out.append(out)
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -506,10 +520,27 @@ class SATVideoDiffusionEngine(nn.Module):
         log = dict()
         x = self.get_input(batch)
         
+        # The released inference path keeps T5 resident while the 3D VAE runs.
+        # On 32 GB cards that combination exceeds memory at 480x720.  The
+        # benchmark enables this opt-in phase offload; numerical inference is
+        # unchanged because conditioning is fully computed before the move.
+        offload_conditioner = os.environ.get("LAYERFLOW_CPU_OFFLOAD_CONDITIONER") == "1"
+        if offload_conditioner:
+            self.conditioner.to(self.device)
         c, uc = self.conditioner.get_unconditional_conditioning(
             batch,
             force_uc_zero_embeddings=ucg_keys if len(self.conditioner.embedders) > 0 else [],
         )
+        if offload_conditioner:
+            self.conditioner.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        offload_dit = os.environ.get("LAYERFLOW_CPU_OFFLOAD_DIT") == "1"
+        if offload_dit:
+            self.model.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
 
         sampling_kwargs = {}
 
@@ -523,7 +554,10 @@ class SATVideoDiffusionEngine(nn.Module):
             log["inputs"] = x.to(torch.float32)
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         z = self.encode_first_stage(x, batch)
-        if not only_log_video_latents:
+        skip_input_reconstruction = (
+            os.environ.get("LAYERFLOW_SKIP_INPUT_RECONSTRUCTION") == "1"
+        )
+        if not only_log_video_latents and not skip_input_reconstruction:
             log["reconstructions"] = self.decode_first_stage(z).to(torch.float32)
             log["reconstructions"] = log["reconstructions"].permute(0, 2, 1, 3, 4).contiguous()
         z = z.permute(0, 2, 1, 3, 4).contiguous()
@@ -533,6 +567,8 @@ class SATVideoDiffusionEngine(nn.Module):
                 c[k], uc[k] = map(lambda y: y[k][:N*frames].to(self.device), (c, uc))
         if self.cat_mode:
             sampling_kwargs["cat_mode"] = self.cat_mode
+        if offload_dit:
+            self.model.to(self.device)
         if 'is_seg' in batch:
             if batch['is_seg'][0]=="True":
                 if self.noised_image_input:
@@ -590,6 +626,10 @@ class SATVideoDiffusionEngine(nn.Module):
                             samples = torch.cat([samples[:, :4],video,samples[:, -4:]],dim=1)
                         elif task_idx ==3:
                             samples = torch.cat([samples, video],dim=1)
+        if offload_dit:
+            self.model.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
         samples = samples.permute(0, 2, 1, 3, 4).contiguous()
         if only_log_video_latents:
             latents = 1.0 / self.scale_factor * samples

@@ -1089,8 +1089,13 @@ class SFTDataset_layer_f3_stage2(Dataset):
                 video, frames, fg_prompt, bl_prompt, bg_prompt = meta['video'], meta['frames'], meta['fg_prompt'], meta['bl_prompt'], meta['bg_prompt']
                 frames = frames[:64]
                 vid_len = len(frames[:64])
-                clip_length = min(vid_len, self.max_num_frames - 1)
-                start_idx   = random.randint(0, vid_len - clip_length)
+                # Inference should consume the exact requested 16-frame clip.
+                # The released code used max_num_frames - 1 and then duplicated
+                # one frame through linspace, shifting benchmark alignment.
+                clip_length = min(vid_len, self.max_num_frames)
+                start_idx = (
+                    random.randint(0, vid_len - clip_length) if self.is_train_data else 0
+                )
                 batch_index = np.linspace(start_idx, start_idx + clip_length - 1, self.max_num_frames, dtype=int)
                 sample_indx = list(batch_index)
                 sample_indx.sort()
